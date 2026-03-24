@@ -22,6 +22,7 @@ from mcp.server.fastmcp import FastMCP
 
 from sounding import __version__
 from sounding.validators import (
+    is_internal_ip,
     sanitize_domain,
     validate_host,
     validate_port,

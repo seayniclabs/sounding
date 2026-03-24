@@ -6,6 +6,9 @@ to verify network functionality against the Docker Compose test targets.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
+import httpx
 import pytest
 
 from sounding.server import (
@@ -141,9 +144,14 @@ async def test_injection_backtick():
 
 @pytest.mark.asyncio
 async def test_http_check_web_target(web_target):
-    """HTTP check against the Docker web target."""
+    """HTTP check against the Docker web target.
+
+    The web target runs on localhost which is now blocked by SSRF protection.
+    We patch the resolver to allow the test target through.
+    """
     host, port = web_target.split(":")
-    result = await http_check(f"http://{host}:{port}/")
+    with patch("sounding.validators._resolve_and_check"):
+        result = await http_check(f"http://{host}:{port}/")
     assert result["status_code"] == 200
     assert result["total_ms"] > 0
 
@@ -223,3 +231,108 @@ async def test_traceroute_shape():
     result = await traceroute("localhost", max_hops=3)
     assert "host" in result
     assert "hops" in result or "error" in result
+
+
+# ── get_public_ip (mocked) ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_public_ip_mocked():
+    """get_public_ip should return the IP from httpbin without hitting the network."""
+    from unittest.mock import MagicMock
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"origin": "203.0.113.42"}
+
+    mock_client_instance = AsyncMock()
+    mock_client_instance.get = AsyncMock(return_value=mock_response)
+    mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+    mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("sounding.server.httpx.AsyncClient", return_value=mock_client_instance):
+        result = await get_public_ip()
+
+    assert result == {"public_ip": "203.0.113.42"}
+    mock_client_instance.get.assert_awaited_once_with("https://httpbin.org/ip")
+
+
+@pytest.mark.asyncio
+async def test_get_public_ip_mocked_error():
+    """get_public_ip should return an error dict on failure."""
+    mock_client_instance = AsyncMock()
+    mock_client_instance.get = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
+    mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+    mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("sounding.server.httpx.AsyncClient", return_value=mock_client_instance):
+        result = await get_public_ip()
+
+    assert "error" in result
+
+
+# ── boundary tests: ping ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_ping_count_zero_rejected():
+    """ping(count=0) should raise ValueError."""
+    with pytest.raises(ValueError, match="count must be between 1 and 100"):
+        await ping("localhost", count=0)
+
+
+@pytest.mark.asyncio
+async def test_ping_count_101_rejected():
+    """ping(count=101) should raise ValueError."""
+    with pytest.raises(ValueError, match="count must be between 1 and 100"):
+        await ping("localhost", count=101)
+
+
+# ── boundary tests: traceroute ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_traceroute_max_hops_zero_rejected():
+    """traceroute(max_hops=0) should raise ValueError."""
+    with pytest.raises(ValueError, match="max_hops must be between 1 and 64"):
+        await traceroute("localhost", max_hops=0)
+
+
+@pytest.mark.asyncio
+async def test_traceroute_max_hops_65_rejected():
+    """traceroute(max_hops=65) should raise ValueError."""
+    with pytest.raises(ValueError, match="max_hops must be between 1 and 64"):
+        await traceroute("localhost", max_hops=65)
+
+
+# ── boundary tests: port_scan ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_port_scan_over_100_ports_rejected():
+    """port_scan with >100 ports should be rejected."""
+    with pytest.raises(ValueError, match="limited to 100"):
+        await port_scan("localhost", ports=list(range(1, 102)))
+
+
+# ── SSRF: http_check blocks internal targets ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_http_check_blocks_loopback():
+    """http_check should block requests to 127.0.0.1."""
+    with pytest.raises(ValueError, match="internal"):
+        await http_check("http://127.0.0.1/")
+
+
+@pytest.mark.asyncio
+async def test_http_check_blocks_private_10():
+    """http_check should block requests to 10.x.x.x."""
+    with pytest.raises(ValueError, match="internal"):
+        await http_check("http://10.0.0.1:8080/")
+
+
+@pytest.mark.asyncio
+async def test_http_check_blocks_metadata():
+    """http_check should block requests to the cloud metadata endpoint."""
+    with pytest.raises(ValueError, match="internal"):
+        await http_check("http://169.254.169.254/latest/meta-data/")

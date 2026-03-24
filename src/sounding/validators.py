@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import socket
+from urllib.parse import urlparse
 
 # Characters that must never appear in a hostname or domain argument.
 _SHELL_META = re.compile(r"[;&|`$(){}!<>\"\'\\\n\r\t]")
@@ -31,9 +33,80 @@ _PRIVATE_NETWORKS = [
     ipaddress.IPv4Network(f"192.168.{0}.0/16"),
 ]
 
+# Internal/dangerous IP ranges that should be blocked for SSRF protection.
+_BLOCKED_NETWORKS = [
+    # RFC 1918 private ranges
+    ipaddress.IPv4Network("10.0.0.0/8"),
+    ipaddress.IPv4Network("172.16.0.0/12"),
+    ipaddress.IPv4Network(f"192.168.{0}.0/16"),
+    # Loopback
+    ipaddress.IPv4Network("127.0.0.0/8"),
+    # Link-local (includes cloud metadata 169.254.169.254)
+    ipaddress.IPv4Network("169.254.0.0/16"),
+    # Unspecified
+    ipaddress.IPv4Network("0.0.0.0/8"),
+]
 
-def validate_host(host: str) -> str:
+_BLOCKED_IPV6 = [
+    ipaddress.IPv6Address("::1"),           # loopback
+    ipaddress.IPv6Address("::"),            # unspecified
+]
+
+
+def is_internal_ip(ip_str: str) -> bool:
+    """Check whether an IP address is internal/private/loopback/link-local.
+
+    Returns True if the IP falls within any blocked range, False otherwise.
+    Works for both IPv4 and IPv6 addresses.
+    """
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+
+    if isinstance(addr, ipaddress.IPv4Address):
+        return any(addr in net for net in _BLOCKED_NETWORKS)
+    elif isinstance(addr, ipaddress.IPv6Address):
+        if addr in _BLOCKED_IPV6:
+            return True
+        # Check IPv4-mapped IPv6 addresses (e.g., ::ffff:127.0.0.1)
+        if addr.ipv4_mapped:
+            return any(addr.ipv4_mapped in net for net in _BLOCKED_NETWORKS)
+        # Check link-local and private IPv6 ranges
+        return addr.is_private or addr.is_loopback or addr.is_link_local
+    return False
+
+
+def _resolve_and_check(hostname: str) -> None:
+    """Resolve a hostname to IP and block internal addresses.
+
+    Raises ``ValueError`` if the hostname resolves to an internal IP.
+    Used for SSRF protection in http_check.
+    """
+    try:
+        results = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except socket.gaierror:
+        # Can't resolve — let the caller handle the connection error downstream.
+        return
+
+    for family, _type, _proto, _canonname, sockaddr in results:
+        ip_str = sockaddr[0]
+        if is_internal_ip(ip_str):
+            raise ValueError(
+                f"URL target resolves to internal IP {ip_str} — "
+                "requests to internal/private/loopback addresses are blocked"
+            )
+
+
+def validate_host(host: str, *, allow_internal: bool = True) -> str:
     """Validate a hostname or IP address.
+
+    Args:
+        host: The hostname or IP to validate.
+        allow_internal: If False, reject internal/private/loopback IPs and
+            hostnames that resolve to them (SSRF protection). Defaults to
+            True since tools like ping and traceroute legitimately target
+            internal networks.
 
     Returns the cleaned host string.
     Raises ``ValueError`` on anything suspicious.
@@ -47,13 +120,25 @@ def validate_host(host: str) -> str:
 
     # Accept valid IP addresses directly.
     try:
-        ipaddress.ip_address(host)
+        addr = ipaddress.ip_address(host)
+        if not allow_internal and is_internal_ip(host):
+            raise ValueError(
+                f"Host {host} is an internal/private/loopback address — "
+                "requests to internal addresses are blocked"
+            )
         return host
-    except ValueError:
+    except ValueError as exc:
+        # Re-raise if it's our own SSRF block, not an ip_address parse error
+        if "internal" in str(exc):
+            raise
         pass
 
     if not _HOSTNAME_RE.match(host):
         raise ValueError(f"Invalid hostname: {host!r}")
+
+    # If internal not allowed, resolve and check the IP
+    if not allow_internal:
+        _resolve_and_check(host)
 
     return host
 
@@ -61,8 +146,11 @@ def validate_host(host: str) -> str:
 def validate_url(url: str) -> str:
     """Validate a URL — only http:// and https:// allowed.
 
+    Performs SSRF protection: resolves the URL hostname and blocks requests
+    to internal/private/loopback/link-local IP addresses.
+
     Returns the original URL string.
-    Raises ``ValueError`` for disallowed schemes.
+    Raises ``ValueError`` for disallowed schemes or internal targets.
     """
     url = url.strip()
     if not url:
@@ -75,6 +163,26 @@ def validate_url(url: str) -> str:
     scheme = url.split("://", 1)[0].lower()
     if scheme not in _ALLOWED_SCHEMES:
         raise ValueError(f"URL scheme {scheme!r} not allowed — use http or https")
+
+    # Extract hostname and check for SSRF
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"Could not extract hostname from URL: {url!r}")
+
+    # Check if hostname is a raw IP
+    try:
+        if is_internal_ip(hostname):
+            raise ValueError(
+                f"URL target {hostname} is an internal/private/loopback address — "
+                "requests to internal addresses are blocked"
+            )
+    except ValueError as exc:
+        if "internal" in str(exc):
+            raise
+
+    # Resolve hostname and check all resulting IPs
+    _resolve_and_check(hostname)
 
     return url
 
