@@ -6,14 +6,35 @@ build-backend = "hatchling.build"
 name = "sounding"
 version = "0.1.0"
 description = "Network diagnostics MCP server — ping, DNS, traceroute, SSL, port scanning, and more."
-readme = {text = "Network diagnostics MCP server.", content-type = "text/plain"}
+readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
+authors = [
+    { name = "Charlie Seay", email = "charlie@seayniclabs.com" },
+]
+keywords = ["mcp", "network", "diagnostics", "dns", "ping", "traceroute", "ssl", "port-scan"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Networking :: Monitoring",
+    "Typing :: Typed",
+]
 dependencies = [
     "mcp[cli]",
     "httpx",
     "dnspython",
 ]
+
+[project.urls]
+Homepage = "https://github.com/seayniclabs/sounding"
+Repository = "https://github.com/seayniclabs/sounding"
+Issues = "https://github.com/seayniclabs/sounding/issues"
 
 [project.optional-dependencies]
 test = [
