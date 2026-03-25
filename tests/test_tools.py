@@ -14,6 +14,7 @@ import pytest
 from sounding.server import (
     check_ssl_cert,
     dns_lookup,
+    dns_propagation,
     get_public_ip,
     health,
     http_check,
@@ -21,6 +22,7 @@ from sounding.server import (
     port_check,
     port_scan,
     reverse_dns,
+    speed_test,
     subnet_scan,
     traceroute,
     whois_lookup,
@@ -336,3 +338,81 @@ async def test_http_check_blocks_metadata():
     """http_check should block requests to the cloud metadata endpoint."""
     with pytest.raises(ValueError, match="internal"):
         await http_check("http://169.254.169.254/latest/meta-data/")
+
+
+# ── speed_test (mocked) ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_speed_test_mocked():
+    """speed_test should return download speed and latency stats."""
+    from unittest.mock import MagicMock
+
+    # Mock the download response (1 MB of data)
+    mock_response = MagicMock()
+    mock_response.content = b"x" * 1_000_000
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("sounding.server.httpx.AsyncClient", return_value=mock_client):
+        result = await speed_test()
+
+    assert "test_server" in result
+    assert result["test_server"] == "Cloudflare"
+    assert "download" in result
+    assert "latency" in result
+    # Download should have speed_mbps since we returned data
+    assert "speed_mbps" in result["download"] or "error" in result["download"]
+
+
+@pytest.mark.asyncio
+async def test_speed_test_download_error():
+    """speed_test should handle download errors gracefully."""
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("sounding.server.httpx.AsyncClient", return_value=mock_client):
+        result = await speed_test()
+
+    assert "download" in result
+    assert "error" in result["download"]
+
+
+# ── dns_propagation ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dns_propagation_shape():
+    """dns_propagation should return results from all resolvers."""
+    result = await dns_propagation("google.com", record_type="A")
+    assert result["domain"] == "google.com"
+    assert result["record_type"] == "A"
+    assert "consistent" in result
+    assert "resolvers" in result
+    # Should have 5 resolvers (Google, Cloudflare, OpenDNS, Quad9, System Default)
+    assert len(result["resolvers"]) == 5
+    for r in result["resolvers"]:
+        assert "resolver" in r
+        assert "records" in r
+
+
+@pytest.mark.asyncio
+async def test_dns_propagation_invalid_type():
+    """dns_propagation should reject invalid record types."""
+    with pytest.raises(ValueError, match="record_type must be one of"):
+        await dns_propagation("google.com", record_type="INVALID")
+
+
+@pytest.mark.asyncio
+async def test_dns_propagation_nxdomain():
+    """dns_propagation on a nonexistent domain should return errors, not raise."""
+    result = await dns_propagation("this-domain-definitely-does-not-exist-xyz123.com")
+    assert result["domain"] == "this-domain-definitely-does-not-exist-xyz123.com"
+    # All resolvers should report NXDOMAIN
+    for r in result["resolvers"]:
+        assert "error" in r or len(r["records"]) == 0

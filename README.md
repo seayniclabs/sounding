@@ -10,7 +10,7 @@
 
 ## What It Does
 
-Sounding is a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that gives AI assistants 12 network diagnostic tools. It handles the things you'd normally reach for `ping`, `dig`, `nmap`, or `openssl` to do -- but exposed as structured, validated MCP tool calls.
+Sounding is a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that gives AI assistants 14 network diagnostic tools. It handles the things you'd normally reach for `ping`, `dig`, `nmap`, or `openssl` to do -- but exposed as structured, validated MCP tool calls.
 
 ## Tools
 
@@ -28,6 +28,8 @@ Sounding is a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) s
 | `http_check` | HTTP request with status, timing, headers, size | `url` |
 | `subnet_scan` | Discover live hosts on a local subnet (RFC 1918 only) | `subnet` (CIDR, max /20) |
 | `get_public_ip` | Get the machine's public IP address | -- |
+| `speed_test` | Measure download speed (Mbps) and latency | -- |
+| `dns_propagation` | Check DNS propagation across public resolvers | `domain`, `record_type` |
 
 ## Installation
 

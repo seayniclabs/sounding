@@ -1,7 +1,7 @@
 """Sounding — network diagnostics MCP server.
 
-Provides 12 tools for network probing, DNS, SSL inspection, and more.
-Runs over stdio transport via FastMCP.
+Provides 14 tools for network probing, DNS, SSL inspection, speed testing,
+and more.  Runs over stdio transport via FastMCP.
 """
 
 from __future__ import annotations
@@ -511,6 +511,175 @@ async def get_public_ip() -> dict:
             return {"public_ip": data.get("origin", "unknown")}
     except Exception as exc:
         return {"error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# 13. speed_test
+# ---------------------------------------------------------------------------
+
+# Cloudflare speed test endpoints — downloads a known payload and times it.
+_SPEED_TEST_URLS = [
+    # 10 MB payload from Cloudflare
+    ("Cloudflare", "https://speed.cloudflare.com/__down?bytes=10000000"),
+]
+
+
+@mcp.tool()
+async def speed_test() -> dict:
+    """Measure network download speed and latency.
+
+    Downloads a 10 MB test payload from Cloudflare and measures throughput.
+    Also measures latency with multiple TCP connect pings.
+    Returns download speed in Mbps and latency stats in milliseconds.
+    """
+    # ── Latency measurement (5 TCP pings to Cloudflare) ──
+    latencies: list[float] = []
+    for _ in range(5):
+        start = time.perf_counter()
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("speed.cloudflare.com", 443),
+                timeout=5,
+            )
+            elapsed = (time.perf_counter() - start) * 1000
+            latencies.append(elapsed)
+            writer.close()
+            await writer.wait_closed()
+        except (OSError, asyncio.TimeoutError):
+            pass
+
+    latency_stats: dict = {}
+    if latencies:
+        avg = sum(latencies) / len(latencies)
+        latency_stats = {
+            "min_ms": round(min(latencies), 2),
+            "avg_ms": round(avg, 2),
+            "max_ms": round(max(latencies), 2),
+        }
+
+    # ── Download speed measurement ──
+    test_server, test_url = _SPEED_TEST_URLS[0]
+    download_mbps: float | None = None
+    download_bytes: int = 0
+    download_ms: float = 0.0
+    dl_error: str | None = None
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0),
+            follow_redirects=True,
+        ) as client:
+            start = time.perf_counter()
+            response = await client.get(test_url)
+            download_ms = (time.perf_counter() - start) * 1000
+            download_bytes = len(response.content)
+
+            if download_bytes > 0 and download_ms > 0:
+                # bits / milliseconds → megabits per second
+                download_mbps = round(
+                    (download_bytes * 8) / (download_ms / 1000) / 1_000_000, 2
+                )
+    except Exception as exc:
+        dl_error = str(exc)
+
+    result: dict = {
+        "test_server": test_server,
+        "latency": latency_stats if latency_stats else {"error": "All pings failed"},
+    }
+
+    if dl_error:
+        result["download"] = {"error": dl_error}
+    else:
+        result["download"] = {
+            "speed_mbps": download_mbps,
+            "bytes_transferred": download_bytes,
+            "duration_ms": round(download_ms, 2),
+        }
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 14. dns_propagation
+# ---------------------------------------------------------------------------
+
+# Public DNS resolvers for propagation checks.
+_PUBLIC_RESOLVERS = {
+    "Google": "8.8.8.8",
+    "Cloudflare": "1.1.1.1",
+    "OpenDNS": "208.67.222.222",
+    "Quad9": "9.9.9.9",
+}
+
+
+@mcp.tool()
+async def dns_propagation(
+    domain: str,
+    record_type: str = "A",
+) -> dict:
+    """Check DNS propagation across multiple public resolvers.
+
+    Queries Google (8.8.8.8), Cloudflare (1.1.1.1), OpenDNS (208.67.222.222),
+    Quad9 (9.9.9.9), and the system default resolver in parallel, then
+    highlights any inconsistencies between them.
+
+    Supported record types: A, AAAA, CNAME, MX, TXT.
+    """
+    domain = sanitize_domain(domain)
+    record_type = record_type.upper()
+    allowed_types = {"A", "AAAA", "CNAME", "MX", "TXT"}
+    if record_type not in allowed_types:
+        raise ValueError(f"record_type must be one of {allowed_types}")
+
+    async def _query(name: str, nameserver: str | None) -> dict:
+        """Query a single resolver and return its results."""
+        resolver = dns.resolver.Resolver()
+        if nameserver:
+            resolver.nameservers = [nameserver]
+        resolver.lifetime = 10  # seconds
+
+        try:
+            answers = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: resolver.resolve(domain, record_type)
+            )
+            records = sorted(str(r) for r in answers)
+            ttl = answers.rrset.ttl if answers.rrset else None
+            return {"resolver": name, "nameserver": nameserver or "system", "records": records, "ttl": ttl}
+        except dns.resolver.NXDOMAIN:
+            return {"resolver": name, "nameserver": nameserver or "system", "records": [], "error": "NXDOMAIN"}
+        except dns.resolver.NoAnswer:
+            return {"resolver": name, "nameserver": nameserver or "system", "records": [], "error": "No answer"}
+        except dns.resolver.NoNameservers:
+            return {"resolver": name, "nameserver": nameserver or "system", "records": [], "error": "No nameservers"}
+        except Exception as exc:
+            return {"resolver": name, "nameserver": nameserver or "system", "records": [], "error": str(exc)}
+
+    # Build tasks: named resolvers + system default
+    tasks = [_query(name, ns) for name, ns in _PUBLIC_RESOLVERS.items()]
+    tasks.append(_query("System Default", None))
+
+    results = await asyncio.gather(*tasks)
+
+    # Detect inconsistencies — compare record sets across resolvers
+    record_sets: dict[str, set[str]] = {}
+    for r in results:
+        if "error" not in r:
+            record_sets[r["resolver"]] = set(r["records"])
+
+    consistent = True
+    if len(record_sets) > 1:
+        reference = next(iter(record_sets.values()))
+        for rs in record_sets.values():
+            if rs != reference:
+                consistent = False
+                break
+
+    return {
+        "domain": domain,
+        "record_type": record_type,
+        "consistent": consistent,
+        "resolvers": results,
+    }
 
 
 # ---------------------------------------------------------------------------
